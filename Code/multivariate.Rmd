@@ -5,7 +5,7 @@ output:
   html_document:
     toc: true
 ---
-`r knitr::opts_knit$set(root.dir='../..')`
+`r knitr::opts_knit$set(root.dir='../')`
 
 # Preamble
 All necessary files are sourced here.  Not shown.
@@ -18,16 +18,17 @@ R.utils::sourceDirectory('Code/Functions')
 
 
 # Basic Info
-The following will show a simple multilevel model to serve as a starting point to a multivariate setting. The other file can be found here ADD FILE LOCATION HERE.
+The following will show a simple multilevel model to serve as a starting point to a multivariate setting. Imagine a setting of $n$ students per $J$ classrooms, with scores on three different tests $S$.
 
 # Generate Data
-First we generate the data given Andres' function which is sourced in the preamble.  In the following we will have 3 scores (S) per student, of which there are 50 students (n) in each of 10 classrooms (J). $\tau$ regards the covariance matrix for the random effects, while $\sigma$ regards the residual covariance matrix.
+First we generate the data given Andres' function which can be found in the Code/Functions folder.  In the following we will have 3 scores (S) per student, of which there are 50 students (n) in each of 10 classrooms (J). $\tau$ regards the covariance matrix for the random effects, while $\sigma$ regards the residual covariance matrix.
 
 
 ```{r genData, cache=TRUE, message=FALSE}
 S = 3
 n = 50
 J = 10
+
 Tau = matrix(c(1, 0, 0, 
                0, 1, 0,
                0, 0, 1), nrow = 3, byrow = TRUE)
@@ -46,7 +47,7 @@ str(schooldat)
 ```
 
 ## Reshape for input to Stan model
-We're going to put the data in wide format, as this will likely make it easier, and probably quicker, to process in Stan.
+We're going to put the data in wide format, as this will likely make it easier, and possibly quicker, to process in Stan.  In the future we will attempt a long form approach, i.e. a single y column of scores.
 
 ```{r reshape2wide, cache=TRUE, message=FALSE, R.options=list(width=200)}
 library(reshape2)
@@ -58,7 +59,7 @@ psych::describe(schoolWide)
 
 # Stan code for univariate model
 
-First we create the model in Stan. 
+First we create the model in Stan. The main parameters of interest are the intercepts, the random effect of classroom for each score, the covariance/correlation of the random effects, and the covariance/correlation of the residuals.
 
 ## Model code
 ```{r stanModelCode, cache=TRUE}
@@ -150,12 +151,12 @@ testwu = 1000
 testthin = 10
 testchains = 2
 
-
 library(rstan)
+suppressMessages({
 fitTest = stan(model_code = stanmodelcode, model_name = "test",
                data = stanTest, iter = testiter, warmup=testwu, thin=testthin, 
                chains = testchains, verbose = F, refresh=100)
-
+})
 
 ### Summarize
 print(fitTest, digits_summary=3, pars=c('Intercept','beta','Tau', 'Sigma', 'scaleTau', 'scaleSigma'),
@@ -238,7 +239,7 @@ acf(Int)
 The coda package has some other diagnostics, demonstrated here.
 
 # Inspect induced Tau correlation
-One might notice that even though the Tau matrix was diagonal, correlations were estimated that were not zero.  This is spurious due to the fact that we had only 10 correlations.
+One might notice that even though the Tau matrix was diagonal, correlations were estimated that were not zero.  This is spurious due to the fact that we had only 10 classrooms.
 
 
 ```{r tauCorrelation, cache=TRUE, fig.path='multivariate_figure_cache/'}
@@ -269,11 +270,13 @@ library(reshape2)
 schoolSlimTest = schooldatTest[,c('S','n','J', 'y')]
 schoolWideTest = dcast(schoolSlimTest, J+n~S)
 
-ranefs = sapply(schoolWideTest[,c('1','2','3')], function(y) ranef(lmer(y~1|J, data=schoolWideTest))$J$'(Intercept)')
+ranefs = sapply(schoolWideTest[,c('1','2','3')], 
+                function(y) ranef(lmer(y~1|J, data=schoolWideTest))$J$'(Intercept)')
 cor(ranefs)
 ```
 
 ## Automate over J sizes
+We'll write a function to look at the Tau correlation matrix over different classroom sizes $J$. With very low J, the correlation might catch your eye, but even then the 95% credible intervals would include zero (see above).  With larger $J$ we get the expected bouncing around zero.
 
 ```{r testRECorr, cache=TRUE, message=FALSE, echo=-1, fig.path='multivariate_figure_cache/'}
 R.utils::sourceDirectory('Code/Functions')
@@ -317,7 +320,7 @@ examineCor = function(J){
 # debugonce(examineCor)
 J = c(10, 25, 50, seq(100, 1000, 100))
 test = examineCor(J) 
-plot(J, test[[2]])
+plot(J, test[[2]], ylab='Mean off-diagonal correlation')
 
 ```
 
