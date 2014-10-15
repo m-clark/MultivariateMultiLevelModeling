@@ -1,0 +1,304 @@
+---
+title: "Univariate Model"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+---
+`r knitr::opts_knit$set(root.dir='../..')`
+
+# Preamble
+All necessary files are sourced here.  Not shown.
+
+```{r preamble, echo=FALSE, message=FALSE}
+### Relies on the following files
+R.utils::sourceDirectory('Code/Functions')
+# load()
+```
+
+
+# Basic Info
+The following will show a simple multilevel model to serve as a starting point to a multivariate setting. Comparisons of results will be made to output from the R pacakges <span style='color:blue'>_lme4_</span>.
+
+# Generate Data
+First we generate the data given Andres' function which is sourced in the preamble.  In the following we will have 3 scores (S) per student, of which there are 50 students (n) in each of 10 classrooms (J). $$\tau$$ regards the covariance matrix for the random effects, while $$\sigma$$ regards the residual covariance matrix.
+
+Since in this example we are only dealing with the univariate setting, the data is then divided according to score of interest, each of which may hten serve as an example.
+
+```{r genData, cache=TRUE, message=FALSE}
+S = 3
+n = 50
+J = 10
+Tau = matrix(c(1, 0, 0, 
+               0, 1, 0,
+               0, 0, 1), nrow = 3, byrow = TRUE)
+
+Sigma = matrix(c(1, 0, 0,  
+                 0, 2^2, 0,
+                 0, 0, 3^2), nrow = 3, byrow = TRUE)
+Mu = c(70, 80, 90)
+
+schooldat = dataGenHMLM2(S=S, n=n, J=J, mu=Mu,   
+                         Tau = Tau, 
+                         Sigma =  Sigma)
+str(schooldat)
+
+# Create subsets
+library(dplyr)
+score1 = schooldat %>%
+  filter(S==1)
+score2 = schooldat %>%
+  filter(S==2)
+score3 = schooldat %>%
+  filter(S==3)
+```
+
+
+# Stan code for univariate model
+
+First we create the model in Stan.  One thing to note is the prior mean for the intercept is set to the overall mean, but otherwise we have a normal distribution for the intercept and random effect, and half-cauchy for the sd/variance parameters.
+
+## Model code
+```{r}
+stanmodelcode = '
+data {
+  int<lower=1> N;                             // number of students per class * number of classes
+  int<lower=1> J;                             // number of classes
+  vector<lower=0>[N] y;                       // Response: test scores
+  int<lower=1,upper=J> classroom[N];          // student classroom
+}
+
+parameters {
+  real Intercept;                             // overall mean
+  real<lower=0> sd_int;                       // sd for ints
+  real<lower=0> sigma_y;                      // residual sd
+  vector[J] mu;                               // classroom effects
+}
+
+transformed parameters {
+  vector[N] yhat;                             // Linear predictor
+  for (n in 1:N)
+    yhat[n] <- mu[classroom[n]];
+}
+
+model {
+  // priors
+  Intercept ~ normal(80, 10);                 // example of weakly informative priors (and ignoring Matt trick for now);
+  mu ~ normal(Intercept, sd_int);
+  sd_int ~ cauchy(0, 2.5);
+  sigma_y ~ cauchy(0, 2.5);
+
+  // likelihood
+  y ~ normal(yhat, sigma_y);
+}
+
+generated quantities{
+  real<lower=0, upper=1>  ICC;
+  
+  ICC <- (sd_int^2)/(sd_int^2+sigma_y^2);
+}
+'
+```
+
+
+
+## Test run
+Next comes a test run.  This is simply to check for compilation, typos, and if there are coding issues that might result in slow convergence.  The run is kept small, and while we glance at the output, it really is of not too much interest at this point.
+
+### Create Stan data list
+```{r, stanDataList, cache=TRUE, message=FALSE, R.options=list(width=200)}
+score1StanTest = list(J=J, N=n*J, y=score1$y, classroom=score1$J)
+```
+
+```{r, stanTest, cache=TRUE}
+testiter = 2000
+testwu = 1000
+testthin = 10
+testchains = 2
+
+
+library(rstan)
+fitTest = stan(model_code = stanmodelcode, model_name = "test",
+               data = score1StanTest, iter = testiter, warmup=testwu, thin=testthin, 
+               chains = testchains, verbose = F, refresh=1000)
+
+
+### Summarize
+print(fitTest, digits_summary=3, pars=c('Intercept','mu','sigma_y', 'sd_int', 'ICC'),
+      probs = c(.025, .5, .975))
+
+pairs(fitTest, pars=c('Intercept','sigma_y', 'sd_int', 'ICC'))
+
+
+### Compare
+library(lme4)
+mod_lme = lmer(y~1+ (1|J), score1)
+summary(mod_lme)
+ranef(mod_lme)$J + fixef(mod_lme)
+
+print(fitTest, digits_summary=3, pars='mu')
+
+### Diagnostic plots
+traceplot(fitTest, pars=c('Intercept','mu','sigma_y', 'sd_int'))
+# traceplot(fitTest, pars=c('Intercept','mu','sigma_y', 'sd_int'), inc_warmup=F)
+```
+
+Comparison to <span style='color:blue'>_lme4_</span> suggests the code is on the right track.
+
+## Main run
+Here we do the main run, bumping up the iterations and number of chains, though in parallel.
+
+
+```{r stanMain1, cache=TRUE, message=FALSE, dependson=-1, R.options=list(width=200)}
+###############################
+### A parallelized approach ###
+###############################
+library(rstan)
+iters = 12000
+wu = 2000
+thin = 10
+chains = 4
+
+
+library(parallel)
+cl = makeCluster(chains)
+clusterEvalQ(cl, library(rstan))
+clusterExport(cl, c('stanmodelcode', 'score1StanTest', 'fitTest', 'iters', 'wu', 'thin'))
+p = proc.time()
+parfit = parSapply(cl, 1:chains, function(i) stan(model_code = stanmodelcode, model_name = "schools", 
+                                             fit = fitTest, data = score1StanTest, iter = iters, 
+                                             warmup=wu, thin=thin, chains = 1, chain_id=i,
+                                             verbose = T, refresh=4000),
+                   simplify=F)
+proc.time() - p
+stopCluster(cl)
+
+# combine the chains
+fitMain = sflist2stanfit(parfit)
+
+# examine some diagnostics
+ainfo = get_adaptation_info(fitMain)
+cat(ainfo[[1]])
+samplerpar = get_sampler_params(fitMain)[[1]]
+summary(samplerpar)
+print(fitMain, pars= c('Intercept','mu','sigma_y', 'sd_int', 'ICC'), digits=3,
+      probs = c(.025, .5, 0.975))
+
+# diagnostics
+traceplot(fitMain, inc_warmup=F, pars=c('Intercept','mu','sigma_y', 'sd_int', 'ICC'))
+
+```
+
+
+
+## Comparison to lme4
+
+```{r lme4Model, cache=TRUE, message=FALSE}
+# library(lme4); library(dplyr)
+
+mod_lme = lmer(y~1+ (1|J), data=score1)
+summary(mod_lme)
+ranef(mod_lme)
+```
+
+# Stan with optimized code
+The following shows one optimization for the random effect.  We also switch to Score 2.
+
+```{r stanOptimized, cache=TRUE, message=FALSE, R.options=list(width=200)}
+stanmodelcodeOpt = '
+data {
+  int<lower=1> N;                             // number of students per class * number of classes
+  int<lower=1> J;                             // number of classes
+  vector<lower=0>[N] y;                       // Response: test scores
+  int<lower=1,upper=J> classroom[N];          // student classroom
+}
+
+parameters {
+  real Intercept;                             // overall mean
+  real<lower=0> sd_int;                       // sd for ints
+  real<lower=0> sigma_y;                      // residual sd
+  vector[J] mu;                               // classroom effects
+}
+
+transformed parameters {
+  vector[N] yhat;                             // Linear predictor
+  for (n in 1:N)
+    yhat[n] <- Intercept + mu[classroom[n]]*sd_int;
+}
+
+model {
+  // priors
+  Intercept ~ normal(80, 10);                 // example of weakly informative priors (and ignoring Matt trick for now);
+  mu ~ normal(0, 1); 
+  sd_int ~ cauchy(0, 2.5);
+  sigma_y ~ cauchy(0, 2.5);
+
+  // likelihood
+  y ~ normal(yhat, sigma_y);
+}
+
+generated quantities{
+  real<lower=0, upper=1>  ICC;
+  
+  ICC <- (sd_int^2)/(sd_int^2 + sigma_y^2);
+
+}
+'
+
+score2StanTest = list(J=J, N=n*J, y=score2$y, classroom=score2$J)
+
+library(rstan)
+iters = 12000
+wu = 2000
+thin = 10
+chains = 4
+
+
+library(parallel)
+cl = makeCluster(chains)
+clusterEvalQ(cl, library(rstan))
+clusterExport(cl, c('stanmodelcodeOpt', 'score2StanTest', 'fitTest', 'iters', 'wu', 'thin'))
+p = proc.time()
+parfit = parSapply(cl, 1:chains, function(i) stan(model_code = stanmodelcodeOpt, 
+                                                  model_name = "schools", 
+                                                  data = score2StanTest, iter = iters, 
+                                                  warmup=wu, thin=thin, chains = 1, chain_id=i, 
+                                                  refresh=4000),
+                   simplify=F)
+proc.time() - p
+stopCluster(cl)
+
+# combine the chains
+fitMain = sflist2stanfit(parfit)
+
+# summary
+print(fitMain, pars= c('Intercept','mu','sigma_y', 'sd_int', 'ICC'), digits=3,
+      probs = c(.025, .05, .5, 0.975))
+
+traceplot(fitMain, pars= c('Intercept','mu','sigma_y', 'sd_int', 'ICC'))
+```
+
+## Compare to lme4
+Again we can compare to the output of <span style='color:blue'>_lme4_</span>.
+
+```{r}
+mod_lme = lmer(y~1+ (1|J), data=score2)
+summary(mod_lme)
+ranef(mod_lme)
+
+```
+
+
+# Save Object/Image
+```{r}
+# save.image()
+```
+
+
+# End of file information
+
+```{r}
+### Subsequent files that rely on this one if any
+# X.R
+# Y.R
+```

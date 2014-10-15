@@ -1,0 +1,9 @@
+base
+dplyr
+inline
+lme4
+Matrix
+mvtnorm
+plyr
+Rcpp
+rstan

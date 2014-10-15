@@ -1,0 +1,11 @@
+base
+coda
+inline
+lattice
+lme4
+Matrix
+mvtnorm
+plyr
+Rcpp
+reshape2
+rstan

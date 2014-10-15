@@ -1,0 +1,338 @@
+---
+title: "Multivariate Model"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+---
+`r knitr::opts_knit$set(root.dir='../..')`
+
+# Preamble
+All necessary files are sourced here.  Not shown.
+
+```{r preamble, echo=FALSE, message=FALSE}
+### Relies on the following files
+R.utils::sourceDirectory('Code/Functions')
+# load()
+```
+
+
+# Basic Info
+The following will show a simple multilevel model to serve as a starting point to a multivariate setting. The other file can be found here ADD FILE LOCATION HERE.
+
+# Generate Data
+First we generate the data given Andres' function which is sourced in the preamble.  In the following we will have 3 scores (S) per student, of which there are 50 students (n) in each of 10 classrooms (J). $\tau$ regards the covariance matrix for the random effects, while $\sigma$ regards the residual covariance matrix.
+
+
+```{r genData, cache=TRUE, message=FALSE}
+S = 3
+n = 50
+J = 10
+Tau = matrix(c(1, 0, 0, 
+               0, 1, 0,
+               0, 0, 1), nrow = 3, byrow = TRUE)
+
+Sigma = matrix(c(1, 0, 0,  
+                 0, 2^2, 0,
+                 0, 0, 3^2), nrow = 3, byrow = TRUE)
+
+Mu = c(70, 80, 90)
+
+schooldat = dataGenHMLM2(S=S, n=n, J=J, mu=Mu,   
+                         Tau = Tau, 
+                         Sigma =  Sigma)
+str(schooldat)
+
+```
+
+## Reshape for input to Stan model
+We're going to put the data in wide format, as this will likely make it easier, and probably quicker, to process in Stan.
+
+```{r reshape2wide, cache=TRUE, message=FALSE, R.options=list(width=200)}
+library(reshape2)
+schoolSlim = schooldat[,c('S','n','J', 'y')]
+schoolWide = dcast(schoolSlim, J+n~S)
+head(schoolWide)
+psych::describe(schoolWide)
+```
+
+# Stan code for univariate model
+
+First we create the model in Stan. 
+
+## Model code
+```{r stanModelCode, cache=TRUE}
+stanmodelcode = '
+data {
+  int<lower=1> N;                             // number of students per class * number of classes
+  int<lower=1> J;                             // number of classes
+  int<lower=1> S;                             // number of scores
+  matrix<lower=0>[N, S] y;                    // Response: test scores
+  int<lower=1,upper=J> classroom[N];          // student classroom
+}
+
+parameters {
+  row_vector[S] Intercept;                    // score means
+  cholesky_factor_corr[S] cholTau;            // chol decomp of corr matrix for RE
+  cholesky_factor_corr[S]  cholSigma;         // chol decomp of residual matrix
+  vector<lower=0>[S] scaleTau;                // scale for Tau
+  vector<lower=0>[S] scaleSigma;              // scale for Sigma
+  matrix[J,S] beta;                           // classroom effects
+}
+
+transformed parameters {
+
+}
+
+model {
+  matrix[S,S] cholmatTau;                     // scaled chol decomp of Tau
+  matrix[S,S] cholmatSigma;                   // scaled chol decomp of Sigma
+  matrix[N,S] yhat;                           // Linear predictor
+  vector[S] zerovec;                          // mean of RE
+
+  zerovec <- rep_vector(0, S);
+  
+  // priors
+  Intercept ~ normal(80, 10);                 
+  cholTau ~ lkj_corr_cholesky(2.0);
+  cholSigma ~ lkj_corr_cholesky(2.0);
+  scaleTau ~ cauchy(0, 2.5);
+  scaleSigma ~ cauchy(0, 2.5);
+
+  // model calculations
+
+  cholmatTau <- diag_matrix(scaleTau) * cholTau;
+  cholmatSigma <- diag_matrix(scaleSigma) * cholSigma;
+
+
+  for (j in 1:J){
+    beta[j] ~ multi_normal_cholesky(zerovec, cholmatTau);
+  }
+
+
+  // likelihood
+  for(n in 1:N){
+    yhat[n] <- Intercept + beta[classroom[n]];
+    y[n] ~ multi_normal_cholesky(yhat[n], cholmatSigma);
+  }
+}
+
+generated quantities{
+  matrix[S,S] Tau;
+  matrix[S,S] Sigma;
+
+  Tau <- tcrossprod(cholTau);
+  Sigma <- tcrossprod(cholSigma);
+}
+'
+```
+
+
+
+## Test run
+Next comes a test run.  This is simply to check for compilation, typos, and if there are coding issues that might result in slow convergence.  The run is kept small, and while we glance at the output, it really is of not too much interest at this point.
+
+### Create Stan data list
+
+First we create the data list containing everything Stan needs to run.
+
+```{r, stanDataList, cache=TRUE, message=FALSE, R.options=list(width=200)}
+stanTest = list(J=J, N=n*J, y=schoolWide[,c('1','2','3')], classroom=schoolWide$J, S=S)
+```
+
+Next comes a test run.  This is simply to check for compilation, typos, and if there are coding issues that might result in slow convergence.  The run is kept small, and while we glance at the output, it really is of not too much interest at this point.
+
+### Run the model
+
+```{r, stanTest, cache=TRUE, message=FALSE, fig.path='multivariate_figure_cache/'}
+testiter = 2000
+testwu = 1000
+testthin = 10
+testchains = 2
+
+
+library(rstan)
+fitTest = stan(model_code = stanmodelcode, model_name = "test",
+               data = stanTest, iter = testiter, warmup=testwu, thin=testthin, 
+               chains = testchains, verbose = F, refresh=100)
+
+
+### Summarize
+print(fitTest, digits_summary=3, pars=c('Intercept','beta','Tau', 'Sigma', 'scaleTau', 'scaleSigma'),
+      probs = c(.025, .5, .975))
+
+# pairs(fitTest, pars=c('Intercept','mu','Tau', 'Sigma', 'scaleTau', 'scaleSigma'))
+traceplot(fitTest)
+
+library(lme4)
+lme4res = sapply(schoolWide[,c('1','2','3')], function(y) lmer(y~1|J, data=schoolWide))
+sapply(lme4res, summary, simplify=F)
+sapply(lme4res, ranef)
+```
+
+# Main model
+
+Now we are ready for the main run, bumping up the iterations etc.
+
+```{r stanMain1, cache=TRUE, message=FALSE, dependson=-1, R.options=list(width=200), fig.path='multivariate_figure_cache/'}
+###############################
+### A parallelized approach ###
+###############################
+library(rstan)
+iters = 22000
+wu = 2000
+thin = 20
+chains = 4
+
+
+library(parallel)
+cl = makeCluster(chains)
+clusterEvalQ(cl, library(rstan))
+clusterExport(cl, c('stanmodelcode', 'stanTest', 'fitTest', 'iters', 'wu', 'thin'))
+p = proc.time()
+parfit = parSapply(cl, 1:chains, function(i) stan(model_code = stanmodelcode, model_name = "schools", 
+                                             fit = fitTest, data = stanTest, iter = iters, 
+                                             warmup=wu, thin=thin, chains = 1, chain_id=i,
+                                             verbose = T, refresh=4000),
+                   simplify=F)
+proc.time() - p
+stopCluster(cl)
+
+# combine the chains
+fitMain = sflist2stanfit(parfit)
+
+
+
+
+print(fitMain, pars= c('Intercept','beta','Tau', 'Sigma', 'scaleTau', 'scaleSigma'), digits=3,
+      probs = c(.025, .5, 0.975))
+
+# examine some diagnostics
+traceplot(fitMain, inc_warmup=F, pars=c('Intercept','beta','Tau', 'Sigma', 'scaleTau', 'scaleSigma'))
+ainfo = get_adaptation_info(fitMain)
+cat(ainfo[[1]])
+samplerpar = get_sampler_params(fitMain)[[1]]
+summary(samplerpar)
+```
+
+
+# Use coda for additional inspection
+## Density and Trace
+
+```{r coda, cache=TRUE, message=FALSE, fig.path='multivariate_figure_cache/'}
+library(coda)
+Int = as.mcmc(extract(fitMain, par='Intercept')$Intercept)
+plot(Int)
+
+betas = extract(fitMain, par='beta')$beta # array
+str(betas)
+plot(as.mcmc(betas[,,1]))
+```
+
+## Autocorrelation
+```{r acf, cache=TRUE, fig.path='multivariate_figure_cache/'}
+acf(Int)
+```
+
+## Other Diagnostics
+The coda package has some other diagnostics, demonstrated here.
+
+# Inspect induced Tau correlation
+One might notice that even though the Tau matrix was diagonal, correlations were estimated that were not zero.  This is spurious due to the fact that we had only 10 correlations.
+
+
+```{r tauCorrelation, cache=TRUE, fig.path='multivariate_figure_cache/'}
+R.utils::sourceDirectory('Code/Functions')
+library(lme4)
+ranefs = sapply(schoolWide[,c('1','2','3')], function(y) ranef(lmer(y~1|J, data=schoolWide))$J$'(Intercept)')
+cor(ranefs) # spurious?
+
+STest = 3
+nTest = 50
+JTest = 500
+TauTest = matrix(c(1, 0, 0, 
+                   0, 1, 0,
+                   0, 0, 1), nrow = 3, byrow = TRUE)
+
+SigmaTest = matrix(c(1, 0, 0,  
+                     0, 2^2, 0,
+                     0, 0, 3^2), nrow = 3, byrow = TRUE)
+
+MuTest = c(70, 80, 90)
+
+schooldatTest = dataGenHMLM2(S=STest, n=nTest, J=JTest, mu=MuTest,   
+                             Tau = TauTest, 
+                             Sigma =  SigmaTest)
+str(schooldatTest)
+
+library(reshape2)
+schoolSlimTest = schooldatTest[,c('S','n','J', 'y')]
+schoolWideTest = dcast(schoolSlimTest, J+n~S)
+
+ranefs = sapply(schoolWideTest[,c('1','2','3')], function(y) ranef(lmer(y~1|J, data=schoolWideTest))$J$'(Intercept)')
+cor(ranefs)
+```
+
+## Automate over J sizes
+
+```{r testRECorr, cache=TRUE, message=FALSE, echo=-1, fig.path='multivariate_figure_cache/'}
+R.utils::sourceDirectory('Code/Functions')
+examineCor = function(J){
+  R.utils::sourceDirectory('Code/Functions')
+  # J is vector of J sizes
+  STest = 3
+  nTest = 50
+  JTest = 500
+  TauTest = matrix(c(1, 0, 0, 
+                     0, 1, 0,
+                     0, 0, 1), nrow = 3, byrow = TRUE)
+  
+  SigmaTest = matrix(c(1, 0, 0,  
+                       0, 2^2, 0,
+                       0, 0, 3^2), nrow = 3, byrow = TRUE)
+  
+  MuTest = c(70, 80, 90)
+  
+  schooldatList = sapply(J, function(j) dataGenHMLM2(S=STest, n=nTest, J=j, mu=MuTest,
+                                                     Tau = TauTest, Sigma =  SigmaTest), 
+                         simplify=F)
+  
+  require(reshape2)
+  schoolSlimList = lapply(schooldatList, function(data) data[,c('S','n','J', 'y')])
+  schoolWideList = suppressMessages({ lapply(schoolSlimList, function(data) dcast(data, J+n~S)) })
+
+  require(lme4)
+  ranefList = lapply(schoolWideList, function(data) 
+    sapply(data[,c('1','2','3')], function(y) ranef(lmer(y~1|J, data=data))$J$'(Intercept)')
+    )
+
+
+  corList = lapply(ranefList, cor)
+  meancor = sapply(corList, function(cormat) mean(cormat[lower.tri(cormat)]))
+  
+  out = list(corList, meancor)
+  out
+}
+  
+# debugonce(examineCor)
+J = c(10, 25, 50, seq(100, 1000, 100))
+test = examineCor(J) 
+plot(J, test[[2]])
+
+```
+
+
+
+# Save Object/Image
+```{r}
+# save.image()
+```
+
+
+# End of file information
+
+```{r}
+### Subsequent files that rely on this one if any
+# X.R
+# Y.R
+```
